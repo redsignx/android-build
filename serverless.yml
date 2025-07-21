@@ -1,0 +1,122 @@
+service: app-test-report-processor
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: nodejs16.x
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 1024
+  timeout: 300
+  logRetentionInDays: 14
+
+  environment:
+    TEST_SERVICE_API: ${param:testServiceApi, 'https://test-service-api.example.com'}
+    REPORTS_BUCKET: ${self:custom.reportsBucket}
+    SQS_QUEUE_URL: !Ref TestReportQueue
+    RETRY_DELAY_SECONDS: 900
+    MAX_RETRIES: 5
+    LOG_LEVEL: ${param:logLevel, 'info'}
+    NODE_OPTIONS: "--enable-source-maps"
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            - sqs:ChangeMessageVisibility
+            - sqs:SendMessage
+          Resource:
+            - !GetAtt TestReportQueue.Arn
+            - !GetAtt TestReportDLQ.Arn
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+          Resource:
+            - !Sub "arn:aws:s3:::${self:custom.reportsBucket}/*"
+        - Effect: Allow
+          Action:
+            - cloudwatch:PutMetricData
+          Resource: "*"
+
+custom:
+  reportsBucket: ${param:reportsBucket, 'app-test-reports-${self:provider.stage}'}
+  esbuild:
+    bundle: true
+    minify: true
+    sourcemap: true
+    target: "node16"
+    define:
+      "process.env.NODE_ENV": "'${self:provider.stage}'"
+    platform: "node"
+    concurrency: 10
+
+functions:
+  processTestReport:
+    handler: src/handlers/processReport.handler
+    events:
+      - sqs:
+          arn: !GetAtt TestReportQueue.Arn
+          batchSize: 1
+          maximumBatchingWindow: 60
+
+resources:
+  Resources:
+    TestReportQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: app-test-report-queue.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: false
+        VisibilityTimeout: 360
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt TestReportDLQ.Arn
+          maxReceiveCount: 5
+
+    TestReportDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: app-test-report-dlq.fifo
+        FifoQueue: true
+        MessageRetentionPeriod: 1209600 # 14 days
+
+    TestReportsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.reportsBucket}
+        LifecycleConfiguration:
+          Rules:
+            - Id: ExpireOldReports
+              Status: Enabled
+              ExpirationInDays: 90
+
+    TestReportQueueAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: TestReportDLQ-Alarm-${self:provider.stage}
+        MetricName: ApproximateNumberOfMessagesVisible
+        Namespace: AWS/SQS
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt TestReportDLQ.QueueName
+        AlarmActions:
+          - !Ref AlertingTopic
+
+    AlertingTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: test-report-alerts-${self:provider.stage}
+
+plugins:
+  - serverless-esbuild
+  - serverless-offline
